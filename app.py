@@ -1,256 +1,297 @@
-import os
 import gradio as gr
 from pathlib import Path
 
+from rag.loader import load_documents
+from rag.chunking import chunk_documents
+from rag.embeddings import create_vector_store
+from rag.chain import build_rag_chain
+from rag.evaluator import evaluate_answer
+from analytics.dataset_loader import load_dataset
+from analytics.eda import generate_dataset_summary, compute_correlations
+from analytics.visualizations import plot_missing_values, plot_correlation_heatmap, plot_feature_importance
+from analytics.insights import generate_ai_insights, generate_correlation_insights
+from analytics.context_builder import build_dataset_context
+from analytics.ml_recommender import detect_target_candidates, generate_ml_recommendations, select_best_target
+from ml.preprocessing import preprocess_dataset
+from ml.trainer import train_baseline_model
+from ml.evaluation import evaluate_model, get_feature_importance
 from langchain_groq import ChatGroq
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
-from langchain_community.document_loaders import PyPDFLoader, TextLoader
-from langchain_community.document_loaders import Docx2txtLoader
-from langchain.prompts import PromptTemplate
-from langchain.chains.question_answering import load_qa_chain
+from ui.layout import create_visualization_tabs
 
 chain = None
-chat_history = []
-doc_summary = ""
+dataset_contexts = {}
 
-# ── 1. DOCUMENT LOADING ───────────────────────────────────────────────────────
-
-def load_documents(file_paths):
-    documents = []
-    for file_path in file_paths:
-        file_path = str(file_path)
-        ext = Path(file_path).suffix.lower()
-        print(f"Loading: {Path(file_path).name}")
-        try:
-            if ext == ".pdf":
-                loader = PyPDFLoader(file_path)
-            elif ext == ".docx":
-                loader = Docx2txtLoader(file_path)
-            elif ext == ".txt":
-                loader = TextLoader(file_path, encoding="utf-8")
-            else:
-                continue
-            docs = loader.load()
-            for doc in docs:
-                doc.metadata["source"] = Path(file_path).name
-            documents.extend(docs)
-            print(f"✅ Loaded {len(docs)} pages from {Path(file_path).name}")
-        except Exception as e:
-            print(f"❌ Error: {e}")
-    return documents
-
-
-# ── 2. CHUNKING ───────────────────────────────────────────────────────────────
-
-def chunk_documents(documents):
-    """
-    Smaller chunks = more precise retrieval.
-    chunk_size=500 gives finer granularity than 800.
-    chunk_overlap=150 gives more context overlap.
-    """
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=150,
-        separators=["\n\n", "\n", ". ", " ", ""]
-    )
-    chunks = splitter.split_documents(documents)
-    print(f"✅ Split into {len(chunks)} chunks")
-    return chunks
-
-
-# ── 3. VECTOR STORE ───────────────────────────────────────────────────────────
-
-def create_vector_store(chunks):
-    print("Creating embeddings...")
-    embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2",
-        model_kwargs={"device": "cpu"}
-    )
-    vector_store = FAISS.from_documents(chunks, embeddings)
-    print(f"✅ Vector store ready — {len(chunks)} vectors")
-    return vector_store, embeddings
-
-
-# ── 4. CUSTOM PROMPTS ─────────────────────────────────────────────────────────
-
-def get_custom_prompt():
-    """
-    This is where the magic happens.
-    A strong system prompt makes the LLM give detailed, structured answers.
-    We tell it exactly how to behave and what to do with the context.
-    """
-    template = """You are an expert research assistant with deep analytical skills.
-Your job is to answer questions based strictly on the provided document context.
-
-INSTRUCTIONS:
-- Give detailed, thorough answers — never give one-line responses
-- Always structure your answer with clear sections when appropriate
-- Quote directly from the documents when relevant (use "quotation marks")
-- If comparing multiple documents, explicitly mention each document by name
-- If the answer is not in the context, say "This information is not in the provided documents"
-- Never hallucinate or make up information not in the context
-- End every answer with a "Key Takeaway" summary in one sentence
-
-CONTEXT FROM DOCUMENTS:
-{context}
-
-CONVERSATION HISTORY:
-{chat_history}
-
-QUESTION: {question}
-
-DETAILED ANSWER:"""
-
-    return PromptTemplate(
-        input_variables=["context", "chat_history", "question"],
-        template=template
-    )
-
-
-# ── 5. RAG CHAIN ──────────────────────────────────────────────────────────────
-
-def build_rag_chain(vector_store, groq_api_key):
-    llm = ChatGroq(
-        api_key=groq_api_key,
-        model="llama-3.1-8b-instant",
-        temperature=0.3,
-        max_tokens=1024   # allow longer, more detailed answers
-    )
-
-    # MMR retrieval — more diverse chunks, less repetition
-    # MMR = Maximal Marginal Relevance
-    # Instead of top-k similar chunks, it picks diverse relevant chunks
-    # This prevents the same sentence being retrieved multiple times
-    retriever = vector_store.as_retriever(
-        search_type="mmr",           # diversity-aware retrieval
-        search_kwargs={
-            "k": 6,                  # retrieve 6 chunks
-            "fetch_k": 20,           # consider top 20 before MMR filtering
-            "lambda_mult": 0.7       # 0=max diversity, 1=max similarity
-        }
-    )
-
-    memory = ConversationBufferMemory(
-        memory_key="chat_history",
-        return_messages=True,
-        output_key="answer"
-    )
-
-    rag_chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=retriever,
-        memory=memory,
-        return_source_documents=True,
-        verbose=False,
-        combine_docs_chain_kwargs={"prompt": get_custom_prompt()}
-    )
-
-    return rag_chain
-
-
-# ── 6. PROCESS DOCUMENTS ──────────────────────────────────────────────────────
+# ── PROCESS DOCUMENTS ──────────────────────────────────────────────────────
 
 def process_documents(files, groq_api_key):
-    global chain, chat_history, doc_summary
+
+    global chain, dataset_contexts
+
+    documents = []
+    chunks = []
 
     if not files:
         return "❌ Please upload at least one document."
+
     if not groq_api_key.strip():
         return "❌ Please enter your Groq API key."
 
     try:
+
         file_paths = [f.name for f in files]
-        documents = load_documents(file_paths)
 
-        if not documents:
-            return "❌ Could not load documents."
+        document_files = [
+            f for f in file_paths
+            if f.endswith((".pdf", ".docx", ".txt"))
+        ]
 
-        chunks = chunk_documents(documents)
-        vector_store, _ = create_vector_store(chunks)
-        chain = build_rag_chain(vector_store, groq_api_key)
-        chat_history = []
+        csv_files = [
+            f for f in file_paths
+            if f.endswith(".csv")
+            ]
 
-        sources = list(set([Path(f.name).name for f in files]))
-        total_chars = sum(len(doc.page_content) for doc in documents)
+        if not document_files and not csv_files:
+            return "❌ No supported files uploaded."
+        
 
-        summary = f"""✅ **Documents processed successfully!**
+        if document_files:
 
-| Detail | Value |
-|--------|-------|
-| Files loaded | {', '.join(sources)} |
-| Document units | {len(documents)} |
-| Chunks created | {len(chunks)} |
-| Total characters | {total_chars:,} |
-| Retrieval method | MMR (diversity-aware) |
-| Chunks per query | 6 |
+            documents = load_documents(document_files)
 
-**Now ask anything — the AI will give detailed, cited answers.**
+        if documents:
 
-**Suggested questions:**
-- "Give me a detailed summary of all documents"
-- "What are the key skills mentioned?"
-- "Compare the main themes across documents"
-- "What evidence supports X claim?"
+            chunks = chunk_documents(documents)
+
+            vector_store = create_vector_store(chunks)
+
+            chain = build_rag_chain(
+                vector_store,
+                groq_api_key
+            )
+
+        total_chars = sum(
+            len(doc.page_content)
+            for doc in documents
+        )
+        summary = "✅ Processing completed!\n\n"
+
+        if documents:
+
+            summary += f"""
+        📄 Document Processing
+
+        Files loaded: {', '.join(document_files)}
+
+        Document units: {len(documents)}
+        Chunks created: {len(chunks)}
+        Total characters: {total_chars:,}
+
+        Retrieval method: MMR
+        Chunks per query: 6
+
+        """
+        
+        analytics_output = ""
+        missing_fig = None
+        corr_fig = None
+        feature_fig = None
+        dataset_contexts = {}
+
+        for csv_file in csv_files:
+
+            df = load_dataset(csv_file)
+
+            if df is not None:
+
+                dataset_summary = generate_dataset_summary(df)
+                target_candidates = detect_target_candidates(df)
+
+                ml_recommendations = generate_ml_recommendations(
+                    dataset_summary,
+                    target_candidates,
+                    groq_api_key
+                )
+
+                corr_matrix = compute_correlations(df)
+                corr_insights = generate_correlation_insights(
+                    corr_matrix,
+                    groq_api_key
+                )
+                corr_fig = plot_correlation_heatmap(corr_matrix)
+                
+                best_target = select_best_target(target_candidates)
+
+                feature_fig = None
+                metrics = None
+                target_column = None
+                task_type = None
+
+                if best_target:
+
+                    target_column = best_target["column"]
+                    task_type = best_target["task"]
+
+                    X_train, X_test, y_train, y_test = (
+                        preprocess_dataset(
+                            df,
+                            target_column
+                        )
+                    )
+
+                    model = train_baseline_model(
+                        X_train,
+                        y_train,
+                        task_type
+                    )
+
+                    metrics = evaluate_model(
+                        model,
+                        X_test,
+                        y_test,
+                        task_type
+                    )
+
+                    feature_importance = get_feature_importance(
+                        model,
+                        X_train.columns
+                    )
+
+                    feature_fig = plot_feature_importance(
+                        feature_importance
+                    )
+
+                dataset_context = build_dataset_context(df, dataset_summary)
+                missing_fig = plot_missing_values(df)
+
+                dataset_contexts[Path(csv_file).name] = dataset_context
+
+                ai_insights = generate_ai_insights(
+                    dataset_summary,
+                    groq_api_key
+                )
+
+                formatted_metrics = ""
+
+                if metrics:
+
+                    for metric_name, value in metrics.items():
+
+                        formatted_metrics += (
+                            f"- {metric_name}: "
+                            f"{value:.4f}\n"
+                        )
+
+                analytics_output += f"""
+
+        ---
+
+        # 📊 Dataset Analysis: {Path(csv_file).name}
+
+        Rows: {dataset_summary['rows']}
+        Columns: {dataset_summary['columns']}
+
+        Numeric Columns:
+        {', '.join(dataset_summary['numeric_columns'])}
+
+        Categorical Columns:
+        {', '.join(dataset_summary['categorical_columns'])}
+
+        ---
+
+        # 🤖 AI Insights
+
+        {ai_insights}
+
+        ---
+
+        # 📈 Correlation Analysis
+
+        {corr_insights}
+
+        ---
+
+        # ⚙️ ML Recommendations
+
+        {ml_recommendations}
+
+        ---
+
+        # 📊 Baseline ML Performance
+
+        Target Column: {target_column}
+        Task Type: {task_type}
+
+        Metrics:
+        {formatted_metrics}
+
 """
-        return summary
+
+        return (
+        summary + analytics_output,
+        missing_fig,
+        corr_fig,
+        feature_fig
+    )
 
     except Exception as e:
+        print(f"Processing error: {e}")
         return f"❌ Error: {str(e)}"
 
-def evaluate_answer(question, answer, source_docs, groq_api_key):
-    """
-    Automatically evaluate RAG answer quality using LLM-as-judge.
-    This is a real technique used in production RAG systems.
-    
-    Metrics:
-    - Faithfulness: Is the answer grounded in the source docs?
-    - Relevance: Does it actually answer the question?
-    - Completeness: Did it use all available context?
-    """
-    if not source_docs:
-        return None
-    
-    context = "\n\n".join([doc.page_content for doc in source_docs[:3]])
-    
-    eval_prompt = f"""You are a RAG evaluation expert. Score this Q&A pair.
 
-QUESTION: {question}
-ANSWER: {answer}
-SOURCE CONTEXT: {context[:1000]}
-
-Rate each metric from 1-5 and explain briefly:
-1. Faithfulness (1-5): Is the answer supported by the context? No hallucinations?
-2. Relevance (1-5): Does the answer directly address the question?
-3. Completeness (1-5): Did it use the context thoroughly?
-
-Respond in exactly this format:
-Faithfulness: X/5 — reason
-Relevance: X/5 — reason  
-Completeness: X/5 — reason
-Overall: X/5"""
-
-    try:
-        llm = ChatGroq(api_key=groq_api_key, model="llama-3.1-8b-instant", temperature=0)
-        response = llm.invoke(eval_prompt)
-        return response.content
-    except:
-        return None
-
-
-# ── 7. ANSWER QUESTION ────────────────────────────────────────────────────────
+# ── ANSWER QUESTION ────────────────────────────────────────────────────────
 
 def answer_question(question, groq_api_key):
-    global chain
-    if chain is None:
-        return "⚠️ Please upload and process documents first.", ""
+    global chain, dataset_contexts
+    if chain is None and not dataset_contexts:
+        return "⚠️ Please upload and process files first.", ""
     if not question.strip():
         return "Please enter a question.", ""
     try:
-        result = chain.invoke({"question": question})
+        combined_dataset_context = ""
+        if dataset_contexts:
+
+            combined_dataset_context = "\n\n".join(
+                [
+                    f"DATASET: {name}\n{context}"
+                    for name, context in dataset_contexts.items()
+                ]
+            )
+        enhanced_question = f"""
+        USER QUESTION:
+        {question}
+
+        DATASET CONTEXT:
+        {combined_dataset_context}
+        """
+        
+        if chain is None and dataset_contexts:
+            llm = ChatGroq(
+                api_key=groq_api_key,
+                model="llama-3.1-8b-instant",
+                temperature=0.3
+            )
+
+            dataset_prompt = f"""
+        You are an expert AI data scientist.
+
+        Use the dataset context below to answer the user's question.
+
+        DATASET CONTEXT:
+        {combined_dataset_context}
+
+        QUESTION:
+        {question}
+
+        Provide a detailed analytical answer.
+        """
+
+            response = llm.invoke(dataset_prompt)
+
+            return response.content, ""
+        
+        result = chain.invoke({
+            "question": enhanced_question
+        })
         answer = result["answer"]
         source_docs = result.get("source_documents", [])
 
@@ -268,7 +309,7 @@ def answer_question(question, groq_api_key):
                 key = f"{source}{page_str}"
                 if key not in seen:
                     seen.add(key)
-                    preview = doc.page_content[:200].replace("\n", " ").strip()
+                    preview = " ".join(    doc.page_content[:200].split())
                     citations += f"\n**[{len(seen)}] {source}{page_str}**\n> {preview}...\n"
 
         # Add evaluation scores
@@ -277,10 +318,11 @@ def answer_question(question, groq_api_key):
 
         return answer, citations
     except Exception as e:
-        return f"❌ Error: {str(e)}", ""
+        print(f"Processing error: {e}")
+        return f"❌ Error: {str(e)}"
 
 
-# ── 8. GRADIO UI ──────────────────────────────────────────────────────────────
+# ── GRADIO UI ──────────────────────────────────────────────────────────────
 
 def chat(question, history, groq_api_key):
     if not question.strip():
@@ -294,14 +336,20 @@ def chat(question, history, groq_api_key):
     return history, ""
 
 
-with gr.Blocks(title="Multi-Document RAG Assistant") as demo:
+with gr.Blocks(title="AI Research & Data Science Assistant") as demo:
 
     gr.Markdown("""
-    # 🧠 Multi-Document AI Research Assistant
-    **Production-grade RAG with MMR retrieval, conversation memory & source citations**
-    
-    Upload PDFs, DOCX, or TXT files and have an intelligent conversation about them.
-    Powered by LangChain · FAISS · HuggingFace Embeddings · Groq Llama 3.1
+    # 🧠 AI Research & Data Science Assistant
+
+    Multi-modal AI platform for:
+
+    - 📄 Document Intelligence (RAG)
+    - 📊 Dataset Analytics
+    - 📈 Automated EDA & Visualizations
+    - 🤖 AI-Generated Insights
+    - ⚙️ Baseline ML Training & Evaluation
+
+    Powered by LangChain · FAISS · Groq · Scikit-learn
     """)
 
     with gr.Row():
@@ -315,11 +363,11 @@ with gr.Blocks(title="Multi-Document RAG Assistant") as demo:
     with gr.Row():
         with gr.Column(scale=1):
             file_upload = gr.Files(
-                label="📁 Upload Documents (PDF, DOCX, TXT)",
-                file_types=[".pdf", ".docx", ".txt"]
+                label="📁 Upload Files (PDF, DOCX, TXT, CSV)",
+                file_types=[".pdf", ".docx", ".txt", ".csv"]
             )
             process_btn = gr.Button("⚙️ Process Documents", variant="primary", size="lg")
-            process_status = gr.Markdown(value="*Upload documents and click Process to begin*")
+            process_status, missing_plot, correlation_plot, feature_plot = create_visualization_tabs()
 
             gr.Markdown("""
             ---
@@ -357,7 +405,7 @@ with gr.Blocks(title="Multi-Document RAG Assistant") as demo:
     process_btn.click(
         fn=process_documents,
         inputs=[file_upload, groq_key],
-        outputs=process_status
+        outputs=[process_status, missing_plot, correlation_plot, feature_plot]
     )
     submit_btn.click(
         fn=chat,

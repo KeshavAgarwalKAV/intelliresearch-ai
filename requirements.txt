@@ -1,12 +1,31 @@
 gradio
+
+# LangChain Ecosystem
 langchain
 langchain-core
 langchain-community
 langchain-groq
 langchain-huggingface
 langchain-text-splitters
+
+# Vector Store
 faiss-cpu
+
+# Embeddings
 sentence-transformers
+
+# Document Loading
 pypdf
 docx2txt
 python-docx
+
+# Data Science
+pandas
+numpy
+scikit-learn
+
+# Visualizations
+matplotlib
+
+# Environment Variables
+python-dotenv

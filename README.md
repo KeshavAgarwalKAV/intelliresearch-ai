@@ -1,4 +1,6 @@
-# 🧠 AI Research & Data Science Assistant
+# 🧠 IntelliResearch AI
+
+AI-Powered Research & Data Science Assistant
 
 An end-to-end AI-powered platform that combines **Document Intelligence**, **Dataset Analytics**, and **Automated Machine Learning Workflows** into a unified conversational interface.
 
@@ -130,7 +132,7 @@ File Type Detection
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/KeshavAgarwalKAV/ai-research-assistant.git
+git clone https://github.com/KeshavAgarwalKAV/intelliresearch-ai.git
 cd ai-research-assistant
 ```
 

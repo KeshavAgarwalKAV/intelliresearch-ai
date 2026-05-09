@@ -336,10 +336,12 @@ def chat(question, history, groq_api_key):
     return history, ""
 
 
-with gr.Blocks(title="AI Research & Data Science Assistant") as demo:
+with gr.Blocks(title="IntelliResearch AI") as demo:
 
     gr.Markdown("""
-    # 🧠 AI Research & Data Science Assistant
+    # 🧠 IntelliResearch AI
+
+    ### AI-Powered Research & Data Science Assistant
 
     Multi-modal AI platform for:
 
@@ -347,7 +349,7 @@ with gr.Blocks(title="AI Research & Data Science Assistant") as demo:
     - 📊 Dataset Analytics
     - 📈 Automated EDA & Visualizations
     - 🤖 AI-Generated Insights
-    - ⚙️ Baseline ML Training & Evaluation
+    - ⚙️ Automated ML Training & Evaluation
 
     Powered by LangChain · FAISS · Groq · Scikit-learn
     """)
